@@ -1,0 +1,426 @@
+"""
+PanditSeva - pandit appointment app (Flask + SQLite)
+Chalane ke liye:  pip install flask   ->   python app.py   ->   http://localhost:5000
+Payment abhi DEMO hai (/pay). Asli payment ke liye Razorpay Checkout yahin jodein.
+Audio/Video call Jitsi Meet ke room link se hoti hai (free). Baad mein Agora/Zego laga sakte hain.
+"""
+import sqlite3, secrets, datetime
+from flask import Flask, request, redirect, session, render_template_string, g, abort, url_for
+
+app = Flask(__name__)
+app.secret_key = "badal-dein-production-mein"
+DB = "pandit.db"
+TIMES = ("10:00", "12:00", "16:00", "18:00")
+
+
+def db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+
+@app.teardown_appcontext
+def close_db(_):
+    d = g.pop("db", None)
+    if d:
+        d.close()
+
+
+def init_db():
+    c = sqlite3.connect(DB)
+    c.executescript("""
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, phone TEXT UNIQUE);
+    CREATE TABLE IF NOT EXISTS pandits(id INTEGER PRIMARY KEY, name TEXT, city TEXT, languages TEXT,
+        specialty TEXT, experience INT, fees INT, rating REAL, about TEXT);
+    CREATE TABLE IF NOT EXISTS bookings(id INTEGER PRIMARY KEY, user_id INT, pandit_id INT, slot TEXT,
+        mode TEXT, amount INT, status TEXT, room TEXT);
+    """)
+    for tbl, col in (("bookings", "order_id TEXT"), ("pandits", "phone TEXT"), ("pandits", "pin TEXT")):
+        try:
+            c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
+    if not c.execute("SELECT 1 FROM pandits").fetchone():
+        c.executemany(
+            "INSERT INTO pandits(name,city,languages,specialty,experience,fees,rating,about) VALUES(?,?,?,?,?,?,?,?)",
+            [
+                ("Pt. Ramesh Sharma", "Varanasi", "Hindi, Sanskrit", "Griha Pravesh, Satyanarayan Katha", 18, 1100, 4.8,
+                 "Kashi ke parampara se shiksha. Ghar ki pooja aur katha ka lamba anubhav."),
+                ("Pt. Suresh Joshi", "Ujjain", "Hindi, Marathi", "Kundli, Vivah Muhurat", 12, 801, 4.6,
+                 "Kundli milan aur vivah muhurat mein visheshagya."),
+                ("Acharya Madhav Iyer", "Chennai", "Tamil, Sanskrit, English", "Havan, Shanti Pooja", 25, 1500, 4.9,
+                 "Vedic havan aur shanti pooja, videsh mein rehne wale parivaron ke liye bhi."),
+                ("Pt. Anil Mishra", "Prayagraj", "Hindi", "Vastu, Kundli Milan", 9, 501, 4.5,
+                 "Vastu salah aur kundli milan, seedhi aur saaf bhasha mein."),
+            ])
+    c.execute("UPDATE pandits SET phone='900000000'||id, pin='1234' WHERE phone IS NULL")
+    c.commit()
+    c.close()
+
+
+def free_slots(pid):
+    taken = {r["slot"] for r in db().execute(
+        "SELECT slot FROM bookings WHERE pandit_id=? AND status IN ('pending','paid')", (pid,))}
+    today = datetime.date.today()
+    out = []
+    for i in range(1, 4):
+        day = today + datetime.timedelta(days=i)
+        out += [f"{day.isoformat()} {t}" for t in TIMES if f"{day.isoformat()} {t}" not in taken]
+    return out
+
+
+@app.template_filter("when")
+def when(s):
+    return datetime.datetime.strptime(s, "%Y-%m-%d %H:%M").strftime("%d %b, %I:%M %p")
+
+
+@app.context_processor
+def inject_user():
+    uid = session.get("uid")
+    u = db().execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone() if uid else None
+    return {"user": u}
+
+
+BASE = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>PanditSeva</title>
+<link href="https://fonts.googleapis.com/css2?family=Tiro+Devanagari+Hindi&family=Mukta:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--ink:#231815;--maroon:#8a1c3a;--gold:#f4b41a;--bg:#f4f5f7;--card:#fff;--mute:#6b6460}
+*{box-sizing:border-box}body{margin:0;font-family:Mukta,system-ui,sans-serif;background:var(--bg);color:var(--ink);line-height:1.5}
+header{background:var(--maroon);color:#fff;padding:14px 18px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+header a{color:#fff;text-decoration:none}.logo{font-family:'Tiro Devanagari Hindi',serif;font-size:1.5rem}
+nav a{margin-left:14px;font-size:.95rem}main{max-width:760px;margin:0 auto;padding:18px}
+h1,h2{font-family:'Tiro Devanagari Hindi',serif;font-weight:400;margin:.2em 0 .5em}
+.card{background:var(--card);border-radius:10px;padding:16px;margin-bottom:14px;border:1px solid #e3e1de}
+.row{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap}
+.mute{color:var(--mute);font-size:.92rem}.rate{background:var(--gold);border-radius:6px;padding:1px 8px;font-weight:600}
+.btn{display:inline-block;background:var(--maroon);color:#fff;border:0;border-radius:8px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer;text-decoration:none}
+.btn:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
+.btn.alt{background:#fff;color:var(--maroon);border:1px solid var(--maroon)}
+input,select{font:inherit;padding:10px;border:1px solid #cfcac5;border-radius:8px;width:100%;margin:4px 0 12px;background:#fff}
+.slots{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-bottom:12px}
+.slots label{border:1px solid #cfcac5;border-radius:8px;padding:8px;cursor:pointer;display:block;background:#fff}
+.slots input{width:auto;margin:0 6px 0 0}.tag{display:inline-block;border-radius:6px;padding:1px 10px;font-size:.85rem;font-weight:600}
+.paid{background:#d9f2e1;color:#14532d}.pending{background:#ffe9b8;color:#6b4500}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(138,28,58,.35)}50%{box-shadow:0 0 0 8px rgba(138,28,58,0)}}
+.card{animation:fadeUp .35s ease both}
+.btn{transition:transform .12s ease}
+.btn:active{transform:scale(.96)}
+.btn.live{animation:pulse 1.6s infinite}
+.card:hover .rate,.card:active .rate{transform:scale(1.08)}
+.rate{display:inline-block;transition:transform .15s ease}
+.callwrap{position:relative;padding-top:62%;border-radius:10px;overflow:hidden;background:#000;animation:fadeUp .4s ease both}
+.callwrap iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
+</style></head><body>
+<header><a class="logo" href="/">PanditSeva</a><nav>
+<a href="/">Pandit</a>{% if user %}<a href="/my">Meri bookings</a><a href="/logout">{{ user.name }} (logout)</a>{% else %}<a href="/login">Login</a>{% endif %}<a href="/pandit-login">Pandit login</a>
+</nav></header><main>%%BODY%%</main></body></html>"""
+
+
+def page(body, **ctx):
+    return render_template_string(BASE.replace("%%BODY%%", body), **ctx)
+
+
+def login_required():
+    if not session.get("uid"):
+        return redirect(url_for("login", next=request.path))
+
+
+@app.route("/")
+def index():
+    q = request.args.get("q", "").strip()
+    like = f"%{q}%"
+    rows = db().execute(
+        "SELECT * FROM pandits WHERE name LIKE ? OR specialty LIKE ? OR city LIKE ? ORDER BY rating DESC",
+        (like, like, like)).fetchall()
+    return page("""
+<h1>Apne liye sahi pandit chunein</h1>
+<form method="get"><input name="q" value="{{ q }}" placeholder="Pooja, shehar ya naam se khojein"></form>
+{% for p in rows %}<div class="card"><div class="row"><div>
+<h2 style="margin:0"><a href="/pandit/{{ p.id }}" style="color:inherit;text-decoration:none">{{ p.name }}</a></h2>
+<div class="mute">{{ p.city }} · {{ p.languages }} · {{ p.experience }} saal ka anubhav</div>
+<div>{{ p.specialty }}</div></div>
+<div style="text-align:right"><span class="rate">★ {{ p.rating }}</span><div><b>₹{{ p.fees }}</b> / session</div></div></div>
+<p><a class="btn" href="/pandit/{{ p.id }}">Booking karein</a></p></div>
+{% else %}<p class="mute">Koi pandit nahi mila. Doosra shabd try karein.</p>{% endfor %}""", rows=rows, q=q)
+
+
+@app.route("/pandit/<int:pid>")
+def pandit(pid):
+    p = db().execute("SELECT * FROM pandits WHERE id=?", (pid,)).fetchone() or abort(404)
+    return page("""
+<div class="card"><div class="row"><h1 style="margin:0">{{ p.name }}</h1><span class="rate">★ {{ p.rating }}</span></div>
+<div class="mute">{{ p.city }} · {{ p.languages }} · {{ p.experience }} saal</div>
+<p>{{ p.about }}</p><p><b>Visheshta:</b> {{ p.specialty }}<br><b>Fees:</b> ₹{{ p.fees }} / session</p></div>
+<form class="card" method="post" action="/book/{{ p.id }}"><h2>Samay chunein</h2>
+{% if slots %}<div class="slots">{% for s in slots %}
+<label><input type="radio" name="slot" value="{{ s }}" required>{{ s|when }}</label>{% endfor %}</div>
+<label>Call ka type<select name="mode"><option value="video">Video call</option><option value="audio">Audio call</option></select></label>
+<button class="btn">Aage badhein: payment</button>
+{% else %}<p class="mute">Agle 3 din mein koi slot khaali nahi hai.</p>{% endif %}</form>""",
+                p=p, slots=free_slots(pid))
+
+
+@app.route("/book/<int:pid>", methods=["POST"])
+def book(pid):
+    if (r := login_required()):
+        return r
+    p = db().execute("SELECT * FROM pandits WHERE id=?", (pid,)).fetchone() or abort(404)
+    slot, mode = request.form.get("slot"), request.form.get("mode", "video")
+    if slot not in free_slots(pid) or mode not in ("video", "audio"):
+        abort(400, "Ye slot ab khaali nahi hai. Doosra slot chunein.")
+    cur = db().execute(
+        "INSERT INTO bookings(user_id,pandit_id,slot,mode,amount,status,room) VALUES(?,?,?,?,?,?,?)",
+        (session["uid"], pid, slot, mode, p["fees"], "pending", "PanditSeva-" + secrets.token_hex(8)))
+    db().commit()
+    return redirect(url_for("pay", bid=cur.lastrowid))
+
+
+def my_booking(bid):
+    b = db().execute(
+        "SELECT b.*, p.name AS pname FROM bookings b JOIN pandits p ON p.id=b.pandit_id WHERE b.id=? AND b.user_id=?",
+        (bid, session.get("uid"))).fetchone()
+    return b or abort(404)
+
+
+@app.route("/pay/<int:bid>", methods=["GET", "POST"])
+def pay(bid):
+    if (r := login_required()):
+        return r
+    b = my_booking(bid)
+    if b["status"] != "pending":
+        return redirect(url_for("booking", bid=bid))
+    if RZP_ID and RZP_SECRET:
+        return rzp_checkout(b)
+    if request.method == "POST":  # Demo mode: Razorpay keys set nahi hain
+        db().execute("UPDATE bookings SET status='paid' WHERE id=?", (bid,))
+        db().commit()
+        return redirect(url_for("booking", bid=bid))
+    return page("""
+<div class="card"><h1>Payment</h1><p>{{ b.pname }} · {{ b.slot|when }} · {{ 'Video' if b.mode=='video' else 'Audio' }} call</p>
+<h2>₹{{ b.amount }}</h2><p class="mute">Ye demo payment hai, asli paisa nahi katega.</p>
+<form method="post"><button class="btn">₹{{ b.amount }} pay karein (demo)</button></form></div>""", b=b)
+
+
+@app.route("/booking/<int:bid>")
+def booking(bid):
+    if (r := login_required()):
+        return r
+    b = my_booking(bid)
+    return page("""
+<div class="card"><h1>{{ 'Booking pakki ho gayi' if b.status=='paid' else 'Payment baaki hai' }}</h1>
+<p><b>{{ b.pname }}</b><br>{{ b.slot|when }} · {{ 'Video' if b.mode=='video' else 'Audio' }} call · ₹{{ b.amount }}</p>
+<span class="tag {{ b.status }}">{{ 'Paid' if b.status=='paid' else 'Pending' }}</span><p>
+{% if b.status=='paid' %}<a class="btn live" href="/call/{{ b.room }}">Call join karein</a>
+{% elif b.status=='done' %}<span class="tag paid">Call poori ho chuki</span>
+{% else %}<a class="btn" href="/pay/{{ b.id }}">Ab pay karein</a>{% endif %}</p>
+<p class="mute">Call ka button sirf paid booking par khulta hai aur ismein hi call hoti hai.</p></div>""", b=b)
+
+
+@app.route("/call/<room>")
+def call(room):
+    b = db().execute("SELECT * FROM bookings WHERE room=?", (room,)).fetchone() or abort(404)
+    ok = session.get("uid") == b["user_id"] or session.get("pid") == b["pandit_id"]
+    if not ok or b["status"] not in ("paid", "done"):
+        abort(403)
+    src = f"https://meet.jit.si/{room}" + ("#config.startWithVideoMuted=true" if b["mode"] == "audio" else "")
+    return page("""<h1>Call</h1><div class="callwrap"><iframe src="{{ src }}"
+allow="camera; microphone; fullscreen; display-capture; autoplay" allowfullscreen></iframe></div>
+<p class="mute">Camera/mic ki permission allow karein. Call khatam karne ke liye ye page band kar dein.</p>""", src=src)
+
+
+@app.route("/my")
+def my():
+    if (r := login_required()):
+        return r
+    rows = db().execute(
+        "SELECT b.*, p.name AS pname FROM bookings b JOIN pandits p ON p.id=b.pandit_id WHERE b.user_id=? ORDER BY b.id DESC",
+        (session["uid"],)).fetchall()
+    return page("""<h1>Meri bookings</h1>
+{% for b in rows %}<a href="/booking/{{ b.id }}" style="text-decoration:none;color:inherit"><div class="card row">
+<div><b>{{ b.pname }}</b><div class="mute">{{ b.slot|when }} · {{ b.mode }}</div></div>
+<span class="tag {{ b.status }}">{{ b.status }}</span></div></a>
+{% else %}<p class="mute">Abhi koi booking nahi hai. <a href="/">Pandit chunein</a>.</p>{% endfor %}""", rows=rows)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    nxt = request.values.get("next", "/")
+    if request.method == "POST":
+        name, phone = request.form["name"].strip(), request.form["phone"].strip()
+        if not name or not phone.isdigit() or len(phone) != 10:
+            return page("<p>Naam aur 10 anko ka mobile number sahi bharein. <a href='/login'>Wapas</a></p>")
+        c = db()
+        c.execute("INSERT OR IGNORE INTO users(name,phone) VALUES(?,?)", (name, phone))
+        c.commit()
+        session["uid"] = c.execute("SELECT id FROM users WHERE phone=?", (phone,)).fetchone()["id"]
+        return redirect(nxt if nxt.startswith("/") else "/")
+    return page("""<form class="card" method="post"><h1>Login</h1><input type="hidden" name="next" value="{{ nxt }}">
+<label>Aapka naam<input name="name" required></label>
+<label>Mobile number<input name="phone" inputmode="numeric" maxlength="10" required></label>
+<button class="btn">Aage badhein</button>
+<p class="mute">Demo mein OTP nahi hai. Asli app mein SMS OTP se verify karein.</p></form>""", nxt=nxt)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
+
+
+# ---------- Razorpay (asli payment) ----------
+# Keys set karein:  RAZORPAY_KEY_ID  aur  RAZORPAY_KEY_SECRET  (nahi hon to demo payment chalta hai)
+import os, hmac, hashlib, json, base64, urllib.request
+
+RZP_ID = os.environ.get("RAZORPAY_KEY_ID")
+RZP_SECRET = os.environ.get("RAZORPAY_KEY_SECRET")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
+COMMISSION = 0.15  # platform ka hissa
+
+
+def rzp_checkout(b):
+    auth = base64.b64encode(f"{RZP_ID}:{RZP_SECRET}".encode()).decode()
+    req = urllib.request.Request(
+        "https://api.razorpay.com/v1/orders",
+        data=json.dumps({"amount": b["amount"] * 100, "currency": "INR", "receipt": f"bk{b['id']}"}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": "Basic " + auth})
+    order = json.load(urllib.request.urlopen(req, timeout=15))
+    db().execute("UPDATE bookings SET order_id=? WHERE id=?", (order["id"], b["id"]))
+    db().commit()
+    return page("""<div class="card"><h1>Payment</h1><p>{{ b.pname }} · {{ b.slot|when }}</p><h2>₹{{ b.amount }}</h2>
+<button class="btn" id="pay">₹{{ b.amount }} pay karein</button></div>
+<form id="f" method="post" action="/pay/{{ b.id }}/verify"><input type="hidden" name="razorpay_payment_id">
+<input type="hidden" name="razorpay_order_id"><input type="hidden" name="razorpay_signature"></form>
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+<script>document.getElementById('pay').onclick=function(){new Razorpay({key:{{ key|tojson }},amount:{{ b.amount*100 }},
+currency:'INR',name:'PanditSeva',order_id:{{ oid|tojson }},handler:function(r){var f=document.getElementById('f');
+for(var k in r){if(f[k])f[k].value=r[k]}f.submit()}}).open()}</script>""", b=b, key=RZP_ID, oid=order["id"])
+
+
+@app.route("/pay/<int:bid>/verify", methods=["POST"])
+def verify(bid):
+    if (r := login_required()):
+        return r
+    if not RZP_SECRET:
+        abort(404)
+    b = my_booking(bid)
+    pid, oid, sig = (request.form.get(k, "") for k in ("razorpay_payment_id", "razorpay_order_id", "razorpay_signature"))
+    good = hmac.new(RZP_SECRET.encode(), f"{oid}|{pid}".encode(), hashlib.sha256).hexdigest()
+    if oid != b["order_id"] or not hmac.compare_digest(good, sig):
+        abort(400, "Payment verify nahi hua. Paisa kata ho to support se sampark karein.")
+    db().execute("UPDATE bookings SET status='paid' WHERE id=?", (bid,))
+    db().commit()
+    return redirect(url_for("booking", bid=bid))
+
+
+# ---------- Pandit dashboard ----------
+def current_pandit():
+    pid = session.get("pid")
+    return db().execute("SELECT * FROM pandits WHERE id=?", (pid,)).fetchone() if pid else None
+
+
+@app.route("/pandit-login", methods=["GET", "POST"])
+def pandit_login():
+    err = ""
+    if request.method == "POST":
+        p = db().execute("SELECT id FROM pandits WHERE phone=? AND pin=?",
+                         (request.form["phone"].strip(), request.form["pin"].strip())).fetchone()
+        if p:
+            session["pid"] = p["id"]
+            return redirect("/dashboard")
+        err = "Mobile ya PIN galat hai."
+    return page("""<form class="card" method="post"><h1>Pandit login</h1>{% if err %}<p class="tag pending">{{ err }}</p>{% endif %}
+<label>Mobile number<input name="phone" inputmode="numeric" required></label><label>PIN<input name="pin" type="password" required></label>
+<button class="btn">Login</button><p class="mute">Demo: mobile 9000000001 se 9000000004, PIN 1234.</p></form>""", err=err)
+
+
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard():
+    p = current_pandit() or abort(403)
+    if request.method == "POST":
+        fees = request.form.get("fees", "")
+        if fees.isdigit() and int(fees) > 0:
+            db().execute("UPDATE pandits SET fees=? WHERE id=?", (int(fees), p["id"]))
+            db().commit()
+        return redirect("/dashboard")
+    rows = db().execute(
+        "SELECT b.*, u.name AS uname FROM bookings b JOIN users u ON u.id=b.user_id "
+        "WHERE b.pandit_id=? AND b.status IN ('paid','done') ORDER BY b.slot", (p["id"],)).fetchall()
+    total = sum(r["amount"] for r in rows)
+    return page("""<h1>{{ p.name }}</h1>
+<div class="card row"><div><div class="mute">Kul kamai (commission ke baad)</div><h2>₹{{ (total*(1-c))|round|int }}</h2></div>
+<form method="post"><label>Meri fees (₹)<input name="fees" value="{{ p.fees }}" inputmode="numeric"></label><button class="btn alt">Fees badlein</button></form></div>
+<h2>Bookings</h2>{% for r in rows %}<div class="card row"><div><b>{{ r.uname }}</b><div class="mute">{{ r.slot|when }} · {{ r.mode }} · ₹{{ r.amount }}</div></div><div>
+<span class="tag {{ 'paid' if r.status=='done' else 'pending' }}">{{ 'Poori hui' if r.status=='done' else 'Aane wali' }}</span>
+{% if r.status=='paid' %}<a class="btn live" href="/call/{{ r.room }}">Call shuru karein</a>
+<form method="post" action="/dashboard/done/{{ r.id }}" style="display:inline"><button class="btn alt">Poori hui</button></form>{% endif %}</div></div>
+{% else %}<p class="mute">Abhi koi paid booking nahi hai.</p>{% endfor %}
+<p><a href="/logout">Logout</a></p>""", p=p, rows=rows, total=total, c=COMMISSION)
+
+
+@app.route("/dashboard/done/<int:bid>", methods=["POST"])
+def mark_done(bid):
+    p = current_pandit() or abort(403)
+    db().execute("UPDATE bookings SET status='done' WHERE id=? AND pandit_id=? AND status='paid'", (bid, p["id"]))
+    db().commit()
+    return redirect("/dashboard")
+
+
+# ---------- Admin panel ----------
+@app.route("/admin", methods=["GET", "POST"])
+def admin():
+    if request.method == "POST" and "password" in request.form:
+        if hmac.compare_digest(request.form["password"], ADMIN_PASSWORD):
+            session["admin"] = True
+        return redirect("/admin")
+    if not session.get("admin"):
+        return page("""<form class="card" method="post"><h1>Admin login</h1>
+<label>Password<input name="password" type="password" required></label><button class="btn">Login</button></form>""")
+    c = db()
+    stats = c.execute("SELECT COUNT(*) n, COALESCE(SUM(amount),0) s FROM bookings WHERE status IN ('paid','done')").fetchone()
+    bookings = c.execute("SELECT b.*, p.name pname, u.name uname FROM bookings b JOIN pandits p ON p.id=b.pandit_id "
+                         "JOIN users u ON u.id=b.user_id ORDER BY b.id DESC LIMIT 100").fetchall()
+    return page("""<h1>Admin panel</h1>
+<div class="card row"><div><div class="mute">Paid bookings</div><h2>{{ st.n }}</h2></div>
+<div><div class="mute">Kul collection</div><h2>₹{{ st.s }}</h2></div>
+<div><div class="mute">Platform commission</div><h2>₹{{ (st.s*c)|round|int }}</h2></div></div>
+<form class="card" method="post" action="/admin/add"><h2>Naya pandit jodein</h2>
+<input name="name" placeholder="Naam" required><input name="city" placeholder="Shehar" required>
+<input name="languages" placeholder="Bhasha (Hindi, Sanskrit)" required><input name="specialty" placeholder="Visheshta" required>
+<input name="experience" placeholder="Anubhav (saal)" inputmode="numeric" required><input name="fees" placeholder="Fees (₹)" inputmode="numeric" required>
+<input name="phone" placeholder="Login mobile (10 anko ka)" inputmode="numeric" required><input name="pin" placeholder="Login PIN" required>
+<button class="btn">Pandit jodein</button></form>
+<h2>Bookings</h2>{% for b in bookings %}<div class="card row"><div><b>{{ b.pname }}</b> ← {{ b.uname }}
+<div class="mute">{{ b.slot|when }} · ₹{{ b.amount }}</div></div><div><span class="tag {{ 'paid' if b.status in ('paid','done') else 'pending' }}">{{ b.status }}</span>
+{% if b.status in ('paid','pending') %}<form method="post" action="/admin/cancel/{{ b.id }}" style="display:inline"><button class="btn alt">Cancel / refund mark</button></form>{% endif %}</div></div>
+{% else %}<p class="mute">Abhi koi booking nahi hai.</p>{% endfor %}
+<p class="mute">Refund asli mein Razorpay dashboard se karein, yahan sirf booking cancel hoti hai aur slot khaali ho jaata hai.</p>""",
+                st=stats, bookings=bookings, c=COMMISSION)
+
+
+@app.route("/admin/add", methods=["POST"])
+def admin_add():
+    session.get("admin") or abort(403)
+    f = request.form
+    if not (f["experience"].isdigit() and f["fees"].isdigit() and f["phone"].isdigit() and len(f["phone"]) == 10):
+        abort(400, "Anubhav, fees aur 10 anko ka mobile number sahi bharein.")
+    db().execute("INSERT INTO pandits(name,city,languages,specialty,experience,fees,rating,about,phone,pin) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                 (f["name"], f["city"], f["languages"], f["specialty"], int(f["experience"]), int(f["fees"]), 4.5,
+                  "Naya pandit, jaldi hi vistrit parichay jodein.", f["phone"], f["pin"]))
+    db().commit()
+    return redirect("/admin")
+
+
+@app.route("/admin/cancel/<int:bid>", methods=["POST"])
+def admin_cancel(bid):
+    session.get("admin") or abort(403)
+    db().execute("UPDATE bookings SET status='refunded' WHERE id=? AND status IN ('paid','pending')", (bid,))
+    db().commit()
+    return redirect("/admin")
+
+
+if __name__ == "__main__":
+    init_db()
+    app.run(debug=True)
